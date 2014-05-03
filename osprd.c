@@ -120,8 +120,24 @@ static void osprd_process_request(osprd_info_t *d, struct request *req)
 	// Consider the 'req->sector', 'req->current_nr_sectors', and
 	// 'req->buffer' members, and the rq_data_dir() function.
 
-	// Your code here.
-	eprintk("Should process request...\n");
+	// Read in request type.
+	uint8_t request_type = rq_data_dir(req);
+
+	// Calculate memory address that contains or will contain data.
+	uint8_t* data_ptr = d->data + (req->sector * SECTOR_SIZE);
+
+	// if READ request, copy data from ramdisk to request buffer
+	if(request_type == READ)
+	{
+		memcpy((void*)req->buffer, (void*)data_ptr, (req->current_nr_sectors * SECTOR_SIZE));
+	}
+	// if WRITE request, copy data from request buffer to ramdisk
+	else if (request_type == WRITE)
+	{
+		memcpy((void*)data_ptr, (void*)req->buffer, (req->current_nr_sectors * SECTOR_SIZE));
+	}
+	// if neither READ nor WRITE, ignore the request
+	// end request in any case
 
 	end_request(req, 1);
 }

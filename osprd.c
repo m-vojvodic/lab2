@@ -80,6 +80,8 @@ typedef struct osprd_info {
 	pid_t write_locking_pid;	// Current ticket process that
 					// holds write lock
 
+	pid_t read_locking_pid;
+
 	pid_list_t* read_locking_pids;	// List of tickets that hold 
 					// a read lock
 
@@ -156,8 +158,8 @@ static void osprd_process_request(osprd_info_t *d, struct request *req)
 
 	// if READ request, copy data from ramdisk to request buffer
 
-	osp_spin_lock(&d->mutex);
-	printk("Locked in process!\n");
+	//osp_spin_lock(&d->mutex);
+	//printk("Locked in process!\n");
 	if(request_type == READ)
 	{
 		memcpy((void*)req->buffer, (void*)data_ptr, (req->current_nr_sectors * SECTOR_SIZE));
@@ -167,8 +169,8 @@ static void osprd_process_request(osprd_info_t *d, struct request *req)
 	{
 		memcpy((void*)data_ptr, (void*)req->buffer, (req->current_nr_sectors * SECTOR_SIZE));
 	}
-	osp_spin_unlock(&d->mutex);
-	printk("Unlocked in process!\n");
+	//osp_spin_unlock(&d->mutex);
+	//printk("Unlocked in process!\n");
 	// if neither READ nor WRITE, ignore the request
 	// end request in any case
 
@@ -207,21 +209,22 @@ static int osprd_close_last(struct inode *inode, struct file *filp)
 		// TODO: deadlock/error checking
 
 		osp_spin_lock(&d->mutex);
-		if(filp_writable)
+		if(filp_writable && d->write_locking_pid == current->pid)
 		{
 			d->write_locking_pid = -1;
 			printk("released write lock\n");
 		}
-		else
+		else // if current->pid is in read_locking_pids
 		{
-			d->num_read_locks--;
+			d->read_locking_pid = -1;
+			//d->num_read_locks--;
 			printk("released read lock\n");
 		}
 		osp_spin_unlock(&d->mutex);
 
 		wake_up_all(&(d->blockq));
 
-		printk("HUNG UP! in osprd_close_last - or did i?\n");
+		//printk("HUNG UP! in osprd_close_last - or did i?\n");
 	}
 
 	return 0;
@@ -300,8 +303,10 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		// TODO: possibly reimplement this?
 		if(wait_event_interruptible(d->blockq, d->ticket_tail == my_ticket &&
 						       d->write_locking_pid == -1 &&
-						       d->num_read_locks == 0))
+						       //d->num_read_locks == 0))
+						       d->read_locking_pid == -1))
 		{
+			printk("In wait_event_interruptible\n");
 			// lock around this??
 			if(d->ticket_tail == my_ticket)
 			{
@@ -348,7 +353,8 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 					d->num_read_locks++;
 				}*/
 				printk("Acquired read lock\n");
-				d->num_read_locks++;
+				//d->num_read_locks++;
+				d->read_locking_pid = current->pid;
 				d->ticket_tail++;
 				osp_spin_unlock(&d->mutex);
 			}
@@ -390,7 +396,8 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		}
 		else
 		{
-			d->num_read_locks--;
+			d->read_locking_pid = -1;
+			//d->num_read_locks--;
 			printk("released read lock\n");
 		}
 		osp_spin_unlock(&d->mutex);
@@ -413,6 +420,7 @@ static void osprd_setup(osprd_info_t *d)
 	/* Add code here if you add fields to osprd_info_t. */
 	osp_spin_lock(&d->mutex);
 	d->write_locking_pid = -1;
+	d->read_locking_pid = -1;
 	d->read_locking_pids = NULL;
 	d->num_read_locks = 0;
 	d->exited_tickets = NULL;

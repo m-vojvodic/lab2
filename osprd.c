@@ -22,7 +22,7 @@
 
 /* This flag is added to an OSPRD file's f_flags to indicate that the file
  * is locked. */
-#define F_OSPRD_LOCKED	0x80000
+#define F_OSPRD_LOCKED	 0x80000
 
 /* eprintk() prints messages to the console.
  * (If working on a real Linux machine, change KERN_NOTICE to KERN_ALERT or
@@ -44,6 +44,19 @@ MODULE_AUTHOR("Karan Kajla & Marko Vojvodic");
 static int nsectors = 32;
 module_param(nsectors, int, 0);
 
+typedef struct ticket_node
+{
+	struct ticket_node* next;
+	unsigned ticket_value;
+
+} ticket_node_t;
+
+typedef struct pid_list_node
+{
+	pid_t pid;
+	struct pid_list_node* next;
+
+} pid_list_t;
 
 /* The internal representation of our device. */
 typedef struct osprd_info {
@@ -62,8 +75,17 @@ typedef struct osprd_info {
 	wait_queue_head_t blockq;       // Wait queue for tasks blocked on
 					// the device lock
 
-	/* HINT: You may want to add additional fields to help
-	         in detecting deadlock. */
+	/* Additional fields */
+
+	pid_t write_locking_pid;	// Current ticket process that
+					// holds write lock
+
+	pid_list_t* read_locking_pids;	// List of tickets that hold 
+					// a read lock
+
+	unsigned num_read_locks;
+
+	ticket_node_t* exited_tickets;
 
 	// The following elements are used internally; you don't need
 	// to understand them.
@@ -78,6 +100,10 @@ static osprd_info_t osprds[NOSPRD];
 
 
 // Declare useful helper functions
+
+// TODO: rewrite for pid_list_t
+void grant_next_alive_ticket(osprd_info_t* info);
+void add_to_ticket_list(ticket_node_t* ticket_list_head, unsigned new_ticket_value);
 
 /*
  * file2osprd(filp)
@@ -126,7 +152,12 @@ static void osprd_process_request(osprd_info_t *d, struct request *req)
 	// Calculate memory address that contains or will contain data.
 	uint8_t* data_ptr = d->data + (req->sector * SECTOR_SIZE);
 
+	/* TODO: error checking */
+
 	// if READ request, copy data from ramdisk to request buffer
+
+	osp_spin_lock(&d->mutex);
+	printk("Locked in process!\n");
 	if(request_type == READ)
 	{
 		memcpy((void*)req->buffer, (void*)data_ptr, (req->current_nr_sectors * SECTOR_SIZE));
@@ -136,6 +167,8 @@ static void osprd_process_request(osprd_info_t *d, struct request *req)
 	{
 		memcpy((void*)data_ptr, (void*)req->buffer, (req->current_nr_sectors * SECTOR_SIZE));
 	}
+	osp_spin_unlock(&d->mutex);
+	printk("Unlocked in process!\n");
 	// if neither READ nor WRITE, ignore the request
 	// end request in any case
 
@@ -171,7 +204,24 @@ static int osprd_close_last(struct inode *inode, struct file *filp)
 
 		// This line avoids compiler warnings; you may remove it.
 		(void) filp_writable, (void) d;
+		// TODO: deadlock/error checking
 
+		osp_spin_lock(&d->mutex);
+		if(filp_writable)
+		{
+			d->write_locking_pid = -1;
+			printk("released write lock\n");
+		}
+		else
+		{
+			d->num_read_locks--;
+			printk("released read lock\n");
+		}
+		osp_spin_unlock(&d->mutex);
+
+		wake_up_all(&(d->blockq));
+
+		printk("HUNG UP! in osprd_close_last - or did i?\n");
 	}
 
 	return 0;
@@ -196,7 +246,6 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 	int filp_writable = (filp->f_mode & FMODE_WRITE) != 0;
 
 	// This line avoids compiler warnings; you may remove it.
-	(void) filp_writable, (void) d;
 
 	// Set 'r' to the ioctl's return value: 0 on success, negative on error
 
@@ -238,8 +287,72 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		// be protected by a spinlock; which ones?)
 
 		// Your code here (instead of the next two lines).
-		eprintk("Attempting to acquire\n");
-		r = -ENOTTY;
+		// eprintk("Attempting to acquire\n");
+		// r = -ENOTTY;
+
+		// TODO: deadlock/error checking
+
+		osp_spin_lock(&d->mutex);
+		unsigned my_ticket = d->ticket_head;
+		d->ticket_head++;
+		osp_spin_unlock(&d->mutex);
+
+		// TODO: possibly reimplement this?
+		if(wait_event_interruptible(d->blockq, d->ticket_tail == my_ticket &&
+						       d->write_locking_pid == -1 &&
+						       d->num_read_locks == 0))
+		{
+			// lock around this??
+			if(d->ticket_tail == my_ticket)
+			{
+				grant_next_alive_ticket(d);
+			}
+			else
+			{
+				add_to_ticket_list(d->exited_tickets, my_ticket);
+			}
+		}
+		else
+		{
+			printk("Passed wait_event_interruptible\n");
+			if(filp_writable)
+			{
+				osp_spin_lock(&d->mutex);
+				filp->f_flags |= F_OSPRD_LOCKED;
+				// set current process to hold the write lock
+				d->write_locking_pid = current->pid;
+				d->ticket_tail++;
+				printk("Acquired write lock\n");
+				osp_spin_unlock(&d->mutex);
+			}
+			else // add to read_locking_tickets
+			{
+				osp_spin_lock(&d->mutex);
+				/*if(&d->read_locking_pids == NULL)
+				{
+					d->read_locking_pids = (pid_list_t*)kmalloc(sizeof(pid_list_t), GFP_ATOMIC);
+					d->read_locking_pids->next = NULL;
+					d->read_locking_pids->next->pid = current->pid;
+					d->num_read_locks++;
+				}
+				else
+				{
+					pid_list_t* current_pid = d->read_locking_pids;
+					while(current_pid->next != NULL)
+					{
+						current_pid = current_pid->next;
+					}
+					current_pid->next = (pid_list_t*)kmalloc(sizeof(pid_list_t), GFP_ATOMIC);
+					current_pid->next->next = NULL;
+					current_pid->next->pid = current->pid;
+					d->num_read_locks++;
+				}*/
+				printk("Acquired read lock\n");
+				d->num_read_locks++;
+				d->ticket_tail++;
+				osp_spin_unlock(&d->mutex);
+			}
+		}
 
 	} else if (cmd == OSPRDIOCTRYACQUIRE) {
 
@@ -264,8 +377,25 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		// you need, and return 0.
 
 		// Your code here (instead of the next line).
-		r = -ENOTTY;
+		// r = -ENOTTY;
 
+		// TODO: deadlock/error checking
+
+		osp_spin_lock(&d->mutex);
+		filp->f_flags &= ~F_OSPRD_LOCKED; // ~ -> bitwise negation
+		if(filp_writable)
+		{
+			d->write_locking_pid = -1;
+			printk("released write lock\n");
+		}
+		else
+		{
+			d->num_read_locks--;
+			printk("released read lock\n");
+		}
+		osp_spin_unlock(&d->mutex);
+
+		wake_up_all(&(d->blockq));
 	} else
 		r = -ENOTTY; /* unknown command */
 	return r;
@@ -281,6 +411,125 @@ static void osprd_setup(osprd_info_t *d)
 	osp_spin_lock_init(&d->mutex);
 	d->ticket_head = d->ticket_tail = 0;
 	/* Add code here if you add fields to osprd_info_t. */
+	osp_spin_lock(&d->mutex);
+	d->write_locking_pid = -1;
+	d->read_locking_pids = NULL;
+	d->num_read_locks = 0;
+	d->exited_tickets = NULL;
+	osp_spin_unlock(&d->mutex); 
+}
+
+/* Helper functions */
+
+/* Node for linked list of processes (denoted by ticket) that hold a lock */
+/* Function to add a ticket to a specified ticket list */
+// TODO: REWRITE FOR pid_list_t
+void add_to_ticket_list(ticket_node_t* ticket_list_head, unsigned new_ticket_value)
+{
+	// Initialize a new ticket_node for the new_ticket_value
+	ticket_node_t* new_ticket_node = (ticket_node_t*)kmalloc(sizeof(ticket_node_t), GFP_ATOMIC);
+	new_ticket_node->ticket_value = new_ticket_value;
+	new_ticket_node->next = NULL;
+
+	if(ticket_list_head == NULL)
+	{
+		ticket_list_head = new_ticket_node;
+	}
+	else
+	{
+		// Append new ticket_node to end of list
+		ticket_node_t* current_ticket = ticket_list_head;
+		while(current_ticket->next != NULL);
+		{
+			current_ticket = current_ticket->next;
+		}
+		current_ticket->next = new_ticket_node;
+	}
+	return;
+}
+
+// Helper function to check if a ticket's process has ended execution. 
+unsigned check_if_dead(unsigned check_ticket_value, ticket_node_t* dead_tickets)
+{
+	if(dead_tickets == NULL)
+	{
+		return 0;
+	}
+
+	ticket_node_t* current_ticket = dead_tickets;
+	while(current_ticket != NULL)
+	{
+		if(check_ticket_value == current_ticket->ticket_value)
+		{
+			return 1;
+		}
+		current_ticket = current_ticket->next;
+	}
+	return 0;
+}
+
+// Function to grant the lock ticket to the next alive process (in order) 
+void grant_next_alive_ticket(osprd_info_t* info)
+{
+	// if next ticket in queue is alive, grant ticket -> wake up process
+	// else loop until ticket is alive
+	// if at last ticket, reset to 0
+	if(info->ticket_tail > info->ticket_head)
+	{
+		info->ticket_tail = 0;
+	}
+
+	// only one ticket
+	if(info->ticket_tail == 0 && info->ticket_tail == info->ticket_head)
+	{
+		// what if dead? no need to worry?
+		return;
+	}
+
+	
+	unsigned my_ticket;
+
+	// current ticket max ticket value
+	if(info->ticket_tail == info->ticket_head)
+	{
+		info->ticket_tail = 0;
+		my_ticket = info->ticket_tail;
+	}
+	else
+	{
+		my_ticket = info->ticket_tail;
+		info->ticket_tail++; 
+	}
+
+	if(info->exited_tickets == NULL)
+	{
+		// no dead tickets, already incremented
+		return;
+	}
+
+	while(info->ticket_tail != my_ticket)
+	{
+		// if current_ticket_value is in dead_tickets, increment
+		// else, return
+		unsigned dead = check_if_dead(info->ticket_tail, info->exited_tickets);
+		if(dead)
+		{
+			// current ticket max ticket value
+			if(info->ticket_tail == info->ticket_head)
+			{
+				info->ticket_tail = 0;
+			}
+			else
+			{
+				info->ticket_tail++; 
+			}		
+		}
+		else
+		{
+			return;
+		}
+	}
+	return;
 }
 
 

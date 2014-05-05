@@ -80,7 +80,7 @@ typedef struct osprd_info {
 	pid_t write_locking_pid;	// Current ticket process that
 					// holds write lock
 
-	pid_t read_locking_pid;
+	//pid_t read_locking_pid;
 
 	pid_list_t* read_locking_pids;	// List of tickets that hold 
 					// a read lock
@@ -102,6 +102,16 @@ static osprd_info_t osprds[NOSPRD];
 
 
 // Declare useful helper functions
+
+/* Add a read locking process into at the head of the list of processes with read locks */
+pid_list_t* add_to_list(pid_list_t* list, pid_t pid);
+
+/* Remove the specified read locking process from the list of processes with read locks */
+pid_list_t* remove_from_list(pid_list_t* list, pid_t pid);
+
+/* Return 1 if the specified process is holding  a read lock 
+ * Return 0 if the specified process does not hold a read lock */
+int has_read_lock(pid_list_t* list, pid_t pid);
 
 // TODO: rewrite for pid_list_t
 void grant_next_alive_ticket(osprd_info_t* info);
@@ -216,8 +226,12 @@ static int osprd_close_last(struct inode *inode, struct file *filp)
 		}
 		else // if current->pid is in read_locking_pids
 		{
-			d->read_locking_pid = -1;
-			//d->num_read_locks--;
+			// remove_from_list(list, pid)
+			if(has_read_lock(d->read_locking_pids, current->pid))
+			{
+				remove_from_list(d->read_locking_pids, current->pid);
+				d->num_read_locks--;
+			}
 			printk("released read lock\n");
 		}
 		osp_spin_unlock(&d->mutex);
@@ -303,8 +317,7 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		// TODO: possibly reimplement this?
 		if(wait_event_interruptible(d->blockq, d->ticket_tail == my_ticket &&
 						       d->write_locking_pid == -1 &&
-						       //d->num_read_locks == 0))
-						       d->read_locking_pid == -1))
+						       d->num_read_locks == 0))
 		{
 			printk("In wait_event_interruptible\n");
 			// lock around this??
@@ -333,6 +346,11 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 			else // add to read_locking_tickets
 			{
 				osp_spin_lock(&d->mutex);
+
+				// add_to_list(list, pid)
+				
+				add_to_list(d->read_locking_pids, current->pid);
+				
 				/*if(&d->read_locking_pids == NULL)
 				{
 					d->read_locking_pids = (pid_list_t*)kmalloc(sizeof(pid_list_t), GFP_ATOMIC);
@@ -353,8 +371,8 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 					d->num_read_locks++;
 				}*/
 				printk("Acquired read lock\n");
-				//d->num_read_locks++;
-				d->read_locking_pid = current->pid;
+				d->num_read_locks++;
+				//d->read_locking_pid = current->pid;
 				d->ticket_tail++;
 				osp_spin_unlock(&d->mutex);
 			}
@@ -396,8 +414,11 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		}
 		else
 		{
-			d->read_locking_pid = -1;
-			//d->num_read_locks--;
+			if(has_read_lock(d->read_locking_pids, current->pid))
+			{
+				remove_from_list(d->read_locking_pids, current->pid);
+				d->num_read_locks--;
+			}
 			printk("released read lock\n");
 		}
 		osp_spin_unlock(&d->mutex);
@@ -420,7 +441,7 @@ static void osprd_setup(osprd_info_t *d)
 	/* Add code here if you add fields to osprd_info_t. */
 	osp_spin_lock(&d->mutex);
 	d->write_locking_pid = -1;
-	d->read_locking_pid = -1;
+	//d->read_locking_pid = -1;
 	d->read_locking_pids = NULL;
 	d->num_read_locks = 0;
 	d->exited_tickets = NULL;
@@ -428,6 +449,59 @@ static void osprd_setup(osprd_info_t *d)
 }
 
 /* Helper functions */
+
+pid_list_t* add_to_list(pid_list_t* list, pid_t pid)
+{
+	pid_list_t* old_head = list;
+	pid_list_t* new_head = (pid_list_t*) kmalloc(sizeof(pid_list_t*), GFP_ATOMIC);
+	new_head->pid = pid;
+	new_head->next = old_head;
+	list = new_head;
+}
+
+pid_list_t* remove_from_list(pid_list_t* list, pid_t pid)
+{
+	if(list == NULL)
+	{
+		return;
+	}
+
+	pid_list_t* temp;
+	if(list->pid == pid) // if removing head
+	{
+		temp = list->next;
+		kfree(list);
+		list = temp;
+	}
+
+	pid_list_t* current_node = list;
+	pid_list_t* prev;
+	while(current_node != NULL)
+	{
+		if(current_node->pid == pid)
+		{
+			temp = current_node->next;
+			kfree(current_node);
+			prev->next = temp;
+		}
+		prev = current_node;
+		current_node = current_node->next;
+	}
+}
+
+int has_read_lock(pid_list_t* list, pid_t pid)
+{
+	pid_list_t* current_node = list;
+	while(current_node != NULL)
+	{
+		if(current_node->pid == pid)
+		{
+			return 1;
+		}
+		current_node = current_node->next;
+	}
+	return 0;
+}
 
 /* Node for linked list of processes (denoted by ticket) that hold a lock */
 /* Function to add a ticket to a specified ticket list */

@@ -20,3 +20,6 @@ Email: mvojvodic@ucla.edu
 
 
 # Add any other information you'd like us to have below this line.
+Limitations:
+The program does not work properly if any /dev/osprdX device already exists
+when ./run-qemu is run. The program will crash on test 15.

@@ -393,11 +393,11 @@ static int osprd_close_last(struct inode *inode, struct file *filp)
 		int filp_writable = filp->f_mode & FMODE_WRITE;
 
 		// if the file hasn't locked the ramdisk, invalid
-		osp_spin_lock(&(d->mutex));
+		//osp_spin_lock(&(d->mutex));
 		if (!pid_in_list(d->write_lock_pids, current->pid) && 
 		    !pid_in_list(d->read_lock_pids, current->pid)) 
 		{
-			osp_spin_unlock(&(d->mutex));
+			//osp_spin_unlock(&(d->mutex));
 			return -EINVAL;
 		}
 
@@ -418,7 +418,7 @@ static int osprd_close_last(struct inode *inode, struct file *filp)
 		{
 			filp->f_flags &= ~F_OSPRD_LOCKED;
 		}
-		osp_spin_unlock(&(d->mutex));
+		//osp_spin_unlock(&(d->mutex));
 
 		wake_up_all(&(d->blockq));
 	}
